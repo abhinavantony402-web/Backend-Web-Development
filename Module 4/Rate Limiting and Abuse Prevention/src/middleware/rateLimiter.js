@@ -1,26 +1,59 @@
 'use strict';
 // middleware/rateLimiter.js
 //
-// YOUR TASK: replace this pass-through with a real rate limiter.
-//
-// Right now this middleware lets EVERY request through, so the login route can be
-// brute-forced without limit. Build a strict limiter with `express-rate-limit`
-// (already in package.json) that is exported as the middleware used by the three
-// auth routes in src/routes/auth.js.
-//
-// Requirements (checked by the tests):
-//   - windowMs: 15 minutes
-//   - max: 5 attempts per window per IP
-//   - after the limit, respond with 429 and a `Retry-After` header
-//   - standardHeaders: true, legacyHeaders: false
-//   - (recommended) skipSuccessfulRequests: true so only FAILED attempts count
-//
-// Also add a COMMENT explaining how a Redis-backed store (rate-limit-redis) would
-// replace the default in-memory store in a multi-instance deployment, and why the
-// in-memory store is not enough when several instances run behind a load balancer.
-//
-// Hint: express-rate-limit returns a middleware function — export it directly:
-//   const rateLimit = require('express-rate-limit');
-//   module.exports = rateLimit({ ...options });
+// Strict limiter for the auth routes (login / register / refresh).
+// Auth endpoints are the classic brute-force target, so they get the tightest
+// budget: 5 attempts per 15-minute window per IP, and only FAILED attempts
+// count toward the limit (skipSuccessfulRequests) so a legitimate user who
+// logs in successfully is never penalized.
 
-module.exports = (req, res, next) => next(); // TODO: replace this stub
+const rateLimit = require('express-rate-limit');
+
+/*
+ * REDIS-BACKED STORE (multi-instance deployments)
+ *
+ * By default express-rate-limit keeps its counters in the Node process's
+ * memory (MemoryStore). That works for a single instance, but it breaks
+ * behind a load balancer running N instances: each instance maintains its
+ * OWN independent counter, so a client whose requests are spread across all
+ * N instances effectively gets N x the limit (5 per instance = 5N total),
+ * defeating the protection entirely. Counters are also lost on every restart
+ * or deploy, resetting the throttle window.
+ *
+ * In production, swap the store for a shared one, e.g. rate-limit-redis,
+ * so every instance reads/writes the SAME counters in Redis:
+ *
+ *   const RedisStore = require('rate-limit-redis');
+ *   const Redis = require('ioredis');
+ *
+ *   module.exports = rateLimit({
+ *     windowMs: 15 * 60 * 1000,
+ *     max: 5,
+ *     store: new RedisStore({
+ *       sendCommand: (...args) => redisClient.call(...args),
+ *     }),
+ *     ...
+ *   });
+ *
+ * With a shared Redis store every instance enforces the same 5-per-window
+ * budget regardless of which pod serves the request.
+ */
+
+module.exports = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,                   // 5 attempts per window per IP
+  standardHeaders: true,    // RateLimit-* headers (draft-6)
+  legacyHeaders: false,     // no X-RateLimit-* headers
+  skipSuccessfulRequests: true, // only failed attempts count
+  handler: (req, res) => {
+    // RateLimitHeaders expose resetTime; compute Retry-After from it.
+    const reset = req.rateLimit && req.rateLimit.resetTime
+      ? Math.ceil((req.rateLimit.resetTime.getTime() - Date.now()) / 1000)
+      : 15 * 60;
+    res.set('Retry-After', String(Math.max(reset, 1)));
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: 'Too many attempts. Please try again later.',
+    });
+  },
+});
